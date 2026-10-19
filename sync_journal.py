@@ -31,7 +31,7 @@ def fetch_swaps():
     out, before = [], None
     while True:
         url = f"https://api.helius.xyz/v0/addresses/{WALLET}/transactions"
-        params = {"api-key": HELIUS_KEY, "type": "SWAP", "limit": 100}
+        params = {"api-key": HELIUS_KEY, "limit": 100}
         if before:
             params["before"] = before
         r = requests.get(url, params=params, timeout=30)
@@ -60,19 +60,26 @@ def sol_usd(ts):
 
 def legs(tx):
     """Return (spent, received) as {mint: amount} for the wallet."""
-    ev = (tx.get("events") or {}).get("swap") or {}
-    spent, got = {}, {}
-    ni, no = ev.get("nativeInput"), ev.get("nativeOutput")
-    if ni and ni.get("account") == WALLET:
-        spent[SOL] = spent.get(SOL, 0) + int(ni["amount"]) / 1e9
-    if no and no.get("account") == WALLET:
-        got[SOL] = got.get(SOL, 0) + int(no["amount"]) / 1e9
-    for side, bucket in (("tokenInputs", spent), ("tokenOutputs", got)):
-        for t in ev.get(side) or []:
-            if t.get("userAccount") == WALLET:
-                raw = t["rawTokenAmount"]
-                amt = int(raw["tokenAmount"]) / 10 ** raw["decimals"]
-                bucket[t["mint"]] = bucket.get(t["mint"], 0) + amt
+    # Net balance change for the wallet, regardless of how Helius labels the tx.
+    if tx.get("transactionError"):
+        return {}, {}
+    delta = {}
+    for t in tx.get("tokenTransfers") or []:
+        mint, amt = t.get("mint"), float(t.get("tokenAmount") or 0)
+        if not mint or mint == SOL:        # wrapped SOL: native balance below covers it
+            continue
+        if t.get("toUserAccount") == WALLET:
+            delta[mint] = delta.get(mint, 0) + amt
+        if t.get("fromUserAccount") == WALLET:
+            delta[mint] = delta.get(mint, 0) - amt
+    for a in tx.get("accountData") or []:
+        if a.get("account") == WALLET:
+            lamports = int(a.get("nativeBalanceChange") or 0)
+            if tx.get("feePayer") == WALLET:
+                lamports += int(tx.get("fee") or 0)   # ignore the network fee
+            delta[SOL] = delta.get(SOL, 0) + lamports / 1e9
+    spent = {m: -d for m, d in delta.items() if d < -1e-9}
+    got = {m: d for m, d in delta.items() if d > 1e-9}
     return spent, got
 
 
@@ -210,7 +217,14 @@ def date(ts): return {"date": {"start": iso(ts)}}
 def main():
     if not HELIUS_KEY or not os.environ.get("NOTION_TOKEN"):
         sys.exit("Set HELIUS_API_KEY and NOTION_TOKEN")
-    events, closed, open_pos = to_trades(fetch_swaps())
+    txs = fetch_swaps()
+    types = {}
+    for t in txs:
+        types[t.get("type")] = types.get(t.get("type"), 0) + 1
+    print(f"fetched {len(txs)} txs; types={types}")
+    if txs:
+        print(f"range {iso(txs[0]['timestamp'])} -> {iso(txs[-1]['timestamp'])}")
+    events, closed, open_pos = to_trades(txs)
 
     # events (append-only, keyed by signature)
     have = {"".join(t["plain_text"] for t in p["properties"]["Tx Signature"]["rich_text"])

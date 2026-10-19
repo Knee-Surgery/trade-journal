@@ -11,6 +11,9 @@ WALLET = "Eiozy5kVAvzrY5h7juAREHa6B3qVsfYL246hQh4GJumq"
 DB_EVENTS = "900ea75d-b46a-40cb-b35f-8703162a1c2f"
 DB_OPEN = "5289c2ff-da55-421d-b27e-c2ca26314241"
 DB_CLOSED = "0f6f708e-8a63-4682-8bbe-2029dcf39a17"
+DB_WINS = "99884c76-e9fd-45c5-9fc9-730e774bae18"
+DB_LOSSES = "56c34621-39f8-4352-a0fd-b00df1f3e5b4"
+PAGE_ID = "3fe93233-c104-81ec-a5c3-cb7f2d29e721"   # Solana Trade Journal page
 
 SOL = "So11111111111111111111111111111111111111112"
 STABLES = {
@@ -138,7 +141,11 @@ def to_trades(txs):
             p["sold_qty"] += sell_qty
             cum += realised
             events.append(dict(sig=sig, ts=ts, type="Exit", mint=mint,
-                               price=usd / qty if qty else 0, pnl=realised, cum=cum))
+                               price=usd / qty if qty else 0, pnl=realised, cum=cum,
+                               # pairing info: the entry this exit belongs to
+                               entry_ts=p["entry_ts"], entry_sig=p["entry_sig"],
+                               entry_price=avg, size=sell_qty, cost=avg * sell_qty,
+                               proceeds=usd * (sell_qty / qty), full=p["qty"] <= DUST))
             if p["qty"] <= DUST:
                 basis = p["first_cost"]
                 closed.append(dict(
@@ -208,6 +215,30 @@ def n_archive(page_id):
                    json={"archived": True}, timeout=30).raise_for_status()
     time.sleep(0.35)
 
+def money(x):
+    return f"-${abs(x):,.2f}" if x < 0 else f"${x:,.2f}"
+
+def update_breakeven(net, wins, losses, unreal):
+    """Rewrite the 'Breakeven tracker' callout on the journal page."""
+    need = max(0.0, -net)
+    net_all = net + unreal
+    need_all = max(0.0, -net_all)
+    txt = (f"Breakeven tracker: net realised PnL {money(net)} (wins {money(wins)}, "
+           f"losses {money(-losses)}). Needed in winning exits to turn positive: {money(need)}. "
+           f"Counting open positions at current prices ({money(unreal)}): "
+           f"net {money(net_all)}, needed {money(need_all)}.")
+    r = requests.get(f"https://api.notion.com/v1/blocks/{PAGE_ID}/children",
+                     headers=NOTION, params={"page_size": 100}, timeout=30)
+    r.raise_for_status()
+    for b in r.json()["results"]:
+        if b["type"] == "callout":
+            plain = "".join(t["plain_text"] for t in b["callout"]["rich_text"])
+            if plain.startswith("Breakeven tracker"):
+                requests.patch(f"https://api.notion.com/v1/blocks/{b['id']}", headers=NOTION, timeout=30,
+                               json={"callout": {"rich_text": [{"text": {"content": txt}}]}}
+                               ).raise_for_status()
+                return
+
 def title(s): return {"title": [{"text": {"content": s}}]}
 def text(s): return {"rich_text": [{"text": {"content": s}}]}
 def num(x): return {"number": None if x is None else float(x)}
@@ -242,6 +273,22 @@ def main():
             "Cumulative PnL (USD)": num(cum if e["type"] == "Exit" else None),
             "Tx": {"url": solscan(e["sig"])}, "Tx Signature": text(e["sig"])})
 
+    # wins / losses: every exit paired with its entry (append-only, keyed by exit tx url)
+    have = set()
+    for db in (DB_WINS, DB_LOSSES):
+        have |= {p["properties"]["Exit Tx"]["url"] for p in n_query(db)}
+    for e in events:
+        if e["type"] != "Exit" or solscan(e["sig"]) in have: continue
+        n_create(DB_WINS if e["pnl"] > 0 else DB_LOSSES, {
+            "Token": title(symbol(e["mint"])), "Mint": text(e["mint"]),
+            "Entry Time": date(e["entry_ts"]), "Exit Time": date(e["ts"]),
+            "Entry Price (USD)": num(e["entry_price"]), "Exit Price (USD)": num(e["price"]),
+            "Size Sold (Tokens)": num(e["size"]), "Cost (USD)": num(e["cost"]),
+            "Proceeds (USD)": num(e["proceeds"]), "PnL (USD)": num(e["pnl"]),
+            "PnL %": num(e["pnl"] / e["cost"] if e["cost"] else None),
+            "Exit Type": {"select": {"name": "Full" if e["full"] else "Partial"}},
+            "Entry Tx": {"url": solscan(e["entry_sig"])}, "Exit Tx": {"url": solscan(e["sig"])}})
+
     # closed trades (append-only, keyed by exit tx url)
     have = {p["properties"]["Exit Tx"]["url"] for p in n_query(DB_CLOSED)}
     for c in closed:
@@ -258,10 +305,12 @@ def main():
 
     # open trades: refresh fully each run (prices change)
     for p in n_query(DB_OPEN): n_archive(p["id"])
+    unreal = 0.0
     for mint, p in open_pos.items():
         entry = p["cost"] / p["qty"]
         now = price_now(mint)
         upnl = (now - entry) * p["qty"] if now else None
+        if upnl is not None: unreal += upnl
         n_create(DB_OPEN, {
             "Token": title(symbol(mint)), "Mint": text(mint), "Entry Time": date(p["entry_ts"]),
             "Entry Price (USD)": num(entry), "Size (Tokens)": num(p["qty"]),
@@ -269,7 +318,12 @@ def main():
             "Unrealised PnL (USD)": num(upnl),
             "Unrealised PnL %": num(upnl / p["cost"] if upnl is not None and p["cost"] else None),
             "Entry Tx": {"url": solscan(p["entry_sig"])}})
-    print(f"events={len(events)} closed={len(closed)} open={len(open_pos)}")
+    exits = [e["pnl"] for e in events if e["type"] == "Exit"]
+    wins = sum(x for x in exits if x > 0)
+    losses = -sum(x for x in exits if x <= 0)
+    update_breakeven(wins - losses, wins, losses, unreal)
+    print(f"events={len(events)} closed={len(closed)} open={len(open_pos)} "
+          f"net_realised={wins - losses:.2f} unrealised={unreal:.2f}")
 
 
 if __name__ == "__main__":

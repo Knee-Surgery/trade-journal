@@ -1,0 +1,18 @@
+name: Sync trade journal
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - run: python sync_journal.py
+        env:
+          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}

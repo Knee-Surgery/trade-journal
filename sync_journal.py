@@ -181,12 +181,42 @@ def symbol(mint):
             _sym[mint] = mint[:6]
     return _sym[mint]
 
-def price_now(mint):
-    try:
-        r = requests.get("https://lite-api.jup.ag/price/v3", params={"ids": mint}, timeout=15).json()
-        return float(r[mint]["usdPrice"])
-    except Exception:
-        return None
+def prices_now(mints):
+    """Batch price lookup: Jupiter first, DexScreener (best-liquidity pair) for anything missing."""
+    mints = list(mints)
+    out = {}
+    for i in range(0, len(mints), 50):
+        chunk = mints[i:i + 50]
+        for attempt in range(3):
+            try:
+                r = requests.get("https://lite-api.jup.ag/price/v3",
+                                 params={"ids": ",".join(chunk)}, timeout=20)
+                if r.status_code == 429:
+                    time.sleep(2 * (attempt + 1)); continue
+                r.raise_for_status()
+                for m, v in (r.json() or {}).items():
+                    if v and v.get("usdPrice") is not None:
+                        out[m] = float(v["usdPrice"])
+                break
+            except Exception:
+                time.sleep(1)
+    missing = [m for m in mints if m not in out]
+    for i in range(0, len(missing), 30):
+        chunk = missing[i:i + 30]
+        try:
+            pairs = requests.get("https://api.dexscreener.com/tokens/v1/solana/" + ",".join(chunk),
+                                 timeout=20).json()
+            best = {}
+            for p in pairs if isinstance(pairs, list) else []:
+                m = (p.get("baseToken") or {}).get("address")
+                liq = ((p.get("liquidity") or {}).get("usd")) or 0
+                if m in chunk and p.get("priceUsd") and liq >= best.get(m, (-1, 0))[0]:
+                    best[m] = (liq, float(p["priceUsd"]))
+            for m, (_, px) in best.items():
+                out[m] = px
+        except Exception:
+            pass
+    return out
 
 
 # ---------- notion ----------
@@ -306,15 +336,20 @@ def main():
     # open trades: refresh fully each run (prices change)
     for p in n_query(DB_OPEN): n_archive(p["id"])
     unreal = 0.0
+    px = prices_now(open_pos.keys())
+    unpriced = [symbol(m) for m in open_pos if m not in px]
+    if unpriced:
+        print("no price found for:", ", ".join(unpriced))
     for mint, p in open_pos.items():
         entry = p["cost"] / p["qty"]
-        now = price_now(mint)
+        now = px.get(mint)
         upnl = (now - entry) * p["qty"] if now else None
         if upnl is not None: unreal += upnl
         n_create(DB_OPEN, {
             "Token": title(symbol(mint)), "Mint": text(mint), "Entry Time": date(p["entry_ts"]),
             "Entry Price (USD)": num(entry), "Size (Tokens)": num(p["qty"]),
             "Cost Basis (USD)": num(p["cost"]), "Current Price (USD)": num(now),
+            "Current Value (USD)": num(now * p["qty"] if now else None),
             "Unrealised PnL (USD)": num(upnl),
             "Unrealised PnL %": num(upnl / p["cost"] if upnl is not None and p["cost"] else None),
             "Entry Tx": {"url": solscan(p["entry_sig"])}})

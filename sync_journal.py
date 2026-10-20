@@ -4,7 +4,7 @@ Env vars: HELIUS_API_KEY, NOTION_TOKEN
 Idempotent: safe to run on a schedule. Average-cost method per token; a trade
 is "closed" when the token balance returns to ~0.
 """
-import os, sys, time, requests
+import os, re, sys, time, requests
 from datetime import datetime, timezone
 
 WALLET = "Eiozy5kVAvzrY5h7juAREHa6B3qVsfYL246hQh4GJumq"
@@ -169,16 +169,59 @@ def iso(ts):
 def solscan(sig):
     return f"https://solscan.io/tx/{sig}"
 
+def looks_random(s):
+    """True for names that are not words: digit/letter mixes or odd mixed-case strings."""
+    if not s or s.isdigit():
+        return True
+    if re.search(r"\d", s) and re.search(r"[A-Za-z]", s):
+        return True
+    if s.isalpha():
+        if s.islower() or s.isupper():
+            return False
+        if re.fullmatch(r"(?:[A-Z][a-z]{2,})+", s):      # Pepe, PepeBot
+            return False
+        return True
+    return False                                           # symbols like $WIF
+
+
+def pretty(raw):
+    """Random-looking names become 'Token ' + first 2 + last 2 characters."""
+    if looks_random(raw):
+        return f"Token {raw[:2]}{raw[-2:]}" if len(raw) > 4 else f"Token {raw}"
+    return raw
+
+
 _sym = {}
+def raw_symbol(mint):
+    """Token ticker from Jupiter (matched on the exact mint, with retries), then DexScreener."""
+    for attempt in range(3):
+        try:
+            r = requests.get("https://lite-api.jup.ag/tokens/v2/search",
+                             params={"query": mint}, timeout=15)
+            if r.status_code == 429:
+                time.sleep(2 * (attempt + 1)); continue
+            hit = next((t for t in (r.json() or []) if t.get("id") == mint), None)
+            if hit and hit.get("symbol"):
+                return hit["symbol"].strip()
+            break
+        except Exception:
+            time.sleep(1)
+    try:
+        pairs = requests.get(f"https://api.dexscreener.com/tokens/v1/solana/{mint}", timeout=15).json()
+        for p in pairs if isinstance(pairs, list) else []:
+            b = p.get("baseToken") or {}
+            if b.get("address") == mint and b.get("symbol"):
+                return b["symbol"].strip()
+    except Exception:
+        pass
+    return mint[:6]
+
 def symbol(mint):
     if mint == SOL: return "SOL"
     if mint not in _sym:
-        try:
-            r = requests.get("https://lite-api.jup.ag/tokens/v2/search",
-                             params={"query": mint}, timeout=15).json()
-            _sym[mint] = (r[0].get("symbol") if r else None) or mint[:6]
-        except Exception:
-            _sym[mint] = mint[:6]
+        raw = raw_symbol(mint)
+        # a failed lookup falls back to the first 6 mint characters, which is never a real name
+        _sym[mint] = f"Token {raw[:2]}{raw[-2:]}" if raw == mint[:6] else pretty(raw)
     return _sym[mint]
 
 def prices_now(mints):
@@ -257,17 +300,53 @@ def update_breakeven(net, wins, losses, unreal):
            f"losses {money(-losses)}). Needed in winning exits to turn positive: {money(need)}. "
            f"Counting open positions at current prices ({money(unreal)}): "
            f"net {money(net_all)}, needed {money(need_all)}.")
-    r = requests.get(f"https://api.notion.com/v1/blocks/{PAGE_ID}/children",
-                     headers=NOTION, params={"page_size": 100}, timeout=30)
-    r.raise_for_status()
-    for b in r.json()["results"]:
-        if b["type"] == "callout":
-            plain = "".join(t["plain_text"] for t in b["callout"]["rich_text"])
-            if plain.startswith("Breakeven tracker"):
-                requests.patch(f"https://api.notion.com/v1/blocks/{b['id']}", headers=NOTION, timeout=30,
-                               json={"callout": {"rich_text": [{"text": {"content": txt}}]}}
-                               ).raise_for_status()
-                return
+    def find(block_id, depth=0):
+        r = requests.get(f"https://api.notion.com/v1/blocks/{block_id}/children",
+                         headers=NOTION, params={"page_size": 100}, timeout=30)
+        r.raise_for_status()
+        for b in r.json()["results"]:
+            if b["type"] == "callout":
+                plain = "".join(t["plain_text"] for t in b["callout"]["rich_text"])
+                if plain.startswith("Breakeven tracker"):
+                    return b["id"]
+            if depth < 2 and b["type"] in ("column_list", "column"):
+                hit = find(b["id"], depth + 1)
+                if hit: return hit
+        return None
+    bid = find(PAGE_ID)
+    if bid:
+        requests.patch(f"https://api.notion.com/v1/blocks/{bid}", headers=NOTION, timeout=30,
+                       json={"callout": {"rich_text": [{"text": {"content": txt}}]}}
+                       ).raise_for_status()
+
+def n_patch(page_id, props):
+    requests.patch(f"https://api.notion.com/v1/pages/{page_id}", headers=NOTION, timeout=30,
+                   json={"properties": props}).raise_for_status()
+    time.sleep(0.35)
+
+def plain(prop, key):
+    return "".join(t["plain_text"] for t in prop.get(key, []))
+
+def rename_pass(events):
+    """Self-healing: re-derive each row's token name from its mint and fix any that differ."""
+    mint_by_sig = {e["sig"]: e["mint"] for e in events}
+    fixed = 0
+    for db in (DB_CLOSED, DB_WINS, DB_LOSSES):
+        for p in n_query(db):
+            mint = plain(p["properties"]["Mint"], "rich_text")
+            if not mint: continue
+            want = symbol(mint)
+            if plain(p["properties"]["Token"], "title") != want:
+                n_patch(p["id"], {"Token": title(want)}); fixed += 1
+    for p in n_query(DB_EVENTS):
+        sig = plain(p["properties"]["Tx Signature"], "rich_text")
+        mint = mint_by_sig.get(sig)
+        sel = (p["properties"]["Type"].get("select") or {}).get("name")
+        if not mint or not sel: continue
+        want = symbol(mint)
+        if plain(p["properties"]["Event"], "title") != f"{sel} {want}":
+            n_patch(p["id"], {"Event": title(f"{sel} {want}"), "Token": text(want)}); fixed += 1
+    if fixed: print(f"renamed {fixed} rows")
 
 def title(s): return {"title": [{"text": {"content": s}}]}
 def text(s): return {"rich_text": [{"text": {"content": s}}]}
@@ -353,6 +432,7 @@ def main():
             "Unrealised PnL (USD)": num(upnl),
             "Unrealised PnL %": num(upnl / p["cost"] if upnl is not None and p["cost"] else None),
             "Entry Tx": {"url": solscan(p["entry_sig"])}})
+    rename_pass(events)
     exits = [e["pnl"] for e in events if e["type"] == "Exit"]
     wins = sum(x for x in exits if x > 0)
     losses = -sum(x for x in exits if x <= 0)

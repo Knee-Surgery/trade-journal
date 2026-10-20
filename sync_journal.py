@@ -217,11 +217,10 @@ def raw_symbol(mint):
     return mint[:6]
 
 def symbol(mint):
+    """Real ticker in capitals (e.g. CATE). If no ticker can be found, the first 6 mint characters."""
     if mint == SOL: return "SOL"
     if mint not in _sym:
-        raw = raw_symbol(mint)
-        # a failed lookup falls back to the first 6 mint characters, which is never a real name
-        _sym[mint] = f"Token {raw[:2]}{raw[-2:]}" if raw == mint[:6] else pretty(raw)
+        _sym[mint] = raw_symbol(mint).upper()
     return _sym[mint]
 
 def prices_now(mints):

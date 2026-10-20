@@ -354,6 +354,50 @@ def num(x): return {"number": None if x is None else float(x)}
 def date(ts): return {"date": {"start": iso(ts)}}
 
 
+def onchain_balances():
+    """Real token balances straight from the wallet (both token programs), keyed by mint."""
+    url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}"
+    out = {}
+    for prog in ("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                 "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"):
+        r = requests.post(url, timeout=30, json={
+            "jsonrpc": "2.0", "id": 1, "method": "getTokenAccountsByOwner",
+            "params": [WALLET, {"programId": prog}, {"encoding": "jsonParsed"}]})
+        r.raise_for_status()
+        j = r.json()
+        if "error" in j:
+            raise RuntimeError(j["error"])
+        for a in j["result"]["value"]:
+            info = a["account"]["data"]["parsed"]["info"]
+            amt = float(info["tokenAmount"].get("uiAmountString") or 0)
+            out[info["mint"]] = out.get(info["mint"], 0) + amt
+    return out
+
+
+def reconcile(open_pos):
+    """Make holdings match the wallet. Quantities come from the chain; cost basis from the trade history."""
+    try:
+        bal = onchain_balances()
+    except Exception as ex:
+        print("balance check failed, using tracked quantities:", repr(ex))
+        return open_pos
+    res = {}
+    for m, q in bal.items():
+        if m == SOL or m in STABLES or q <= DUST:
+            continue
+        p = open_pos.get(m)
+        if p:
+            if abs(q - p["qty"]) > max(1e-6 * p["qty"], 1e-9):
+                print(f"qty fixed {symbol(m)}: tracked {p['qty']:.6f} -> on-chain {q:.6f}")
+            res[m] = dict(p, cost=p["cost"] / p["qty"] * q, qty=q)
+        else:
+            res[m] = dict(qty=q, cost=None, entry_ts=int(time.time()), entry_sig=None, untracked=True)
+    for m in open_pos:
+        if m not in res:
+            print(f"dropped {symbol(m)}: no balance in wallet")
+    return res
+
+
 # ---------- charts (PNG files, committed to the repo and shown in Notion) ----------
 BG, CARD, TXT, MUTED, GRID = "#0F1419", "#171D26", "#E8EDF2", "#8B98A9", "#273041"
 GREEN, RED, BLUE = "#2FD08A", "#FF5C6C", "#5B9DFF"
@@ -552,10 +596,19 @@ def main():
             "Hold Time (hrs)": num((c["exit_ts"] - c["entry_ts"]) / 3600),
             "Entry Tx": {"url": solscan(c["entry_sig"])}, "Exit Tx": {"url": solscan(c["exit_sig"])}})
 
-    # open trades: refresh fully each run (prices change)
+    # open trades: refresh fully each run (prices change); quantities verified against the wallet
+    open_pos = reconcile(open_pos)
+    px = prices_now(open_pos.keys())
+    for m in list(open_pos):                      # holdings with no trade history: only keep real ones
+        p = open_pos[m]
+        if p.get("untracked"):
+            now = px.get(m)
+            if not now or now * p["qty"] < 0.10:
+                del open_pos[m]; continue
+            p["cost"] = now * p["qty"]            # true cost unknown: PnL starts from now
+            print(f"untracked holding {symbol(m)}: {p['qty']:.4f} tokens = ${p['cost']:.2f}")
     for p in n_query(DB_OPEN): n_archive(p["id"])
     unreal = 0.0
-    px = prices_now(open_pos.keys())
     unpriced = [symbol(m) for m in open_pos if m not in px]
     if unpriced:
         print("no price found for:", ", ".join(unpriced))
@@ -564,14 +617,18 @@ def main():
         now = px.get(mint)
         upnl = (now - entry) * p["qty"] if now else None
         if upnl is not None: unreal += upnl
-        n_create(DB_OPEN, {
+        props = {
             "Token": title(symbol(mint)), "Mint": text(mint), "Entry Time": date(p["entry_ts"]),
             "Entry Price (USD)": num(entry), "Size (Tokens)": num(p["qty"]),
             "Cost Basis (USD)": num(p["cost"]), "Current Price (USD)": num(now),
             "Current Value (USD)": num(now * p["qty"] if now else None),
             "Unrealised PnL (USD)": num(upnl),
-            "Unrealised PnL %": num(upnl / p["cost"] if upnl is not None and p["cost"] else None),
-            "Entry Tx": {"url": solscan(p["entry_sig"])}})
+            "Unrealised PnL %": num(upnl / p["cost"] if upnl is not None and p["cost"] else None)}
+        if p.get("entry_sig"):
+            props["Entry Tx"] = {"url": solscan(p["entry_sig"])}
+        if p.get("untracked"):
+            props["Notes"] = text("Bought outside tracked history: cost basis set at the price when first seen")
+        n_create(DB_OPEN, props)
     rename_pass(events)
     exits = [e["pnl"] for e in events if e["type"] == "Exit"]
     wins = sum(x for x in exits if x > 0)

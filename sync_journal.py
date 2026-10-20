@@ -354,6 +354,146 @@ def num(x): return {"number": None if x is None else float(x)}
 def date(ts): return {"date": {"start": iso(ts)}}
 
 
+# ---------- charts (PNG files, committed to the repo and shown in Notion) ----------
+BG, CARD, TXT, MUTED, GRID = "#0F1419", "#171D26", "#E8EDF2", "#8B98A9", "#273041"
+GREEN, RED, BLUE = "#2FD08A", "#FF5C6C", "#5B9DFF"
+
+def _style(ax, fig):
+    fig.patch.set_facecolor(BG)
+    ax.set_facecolor(CARD)
+    for s in ax.spines.values(): s.set_visible(False)
+    ax.tick_params(colors=MUTED, labelsize=10, length=0)
+    ax.grid(color=GRID, linewidth=0.8, alpha=0.8)
+    ax.set_axisbelow(True)
+
+def _title(fig, title, sub):
+    fig.text(0.035, 0.945, title, color=TXT, fontsize=17, fontweight="bold", va="top")
+    fig.text(0.035, 0.885, sub, color=MUTED, fontsize=10.5, va="top")
+
+def _usd(x, _=None):
+    return f"-\\${abs(x):,.2f}" if x < 0 else f"\\${x:,.2f}"   # escaped so matplotlib does not read $..$ as math
+
+def make_charts(events, open_rows, namef, outdir="charts"):
+    """Render four dashboard PNGs. Never raises into the sync (caller wraps it)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    os.makedirs(outdir, exist_ok=True)
+    plt.rcParams["font.family"] = ["Inter", "DejaVu Sans"]
+    stamp = datetime.now(timezone.utc).strftime("%d %b %Y %H:%M UTC")
+
+    # 1. cumulative PnL with entries and exits
+    fig, ax = plt.subplots(figsize=(12, 6.2))
+    fig.subplots_adjust(left=0.08, right=0.97, top=0.80, bottom=0.12)
+    _style(ax, fig)
+    xs, ys, run = [], [], 0.0
+    ent_x, ent_y, win_x, win_y, loss_x, loss_y = [], [], [], [], [], []
+    for e in events:
+        t = datetime.fromtimestamp(e["ts"], tz=timezone.utc)
+        if e["type"] == "Exit":
+            xs += [t, t]; ys += [run, e["cum"]]; run = e["cum"]
+            (win_x if e["pnl"] > 0 else loss_x).append(t)
+            (win_y if e["pnl"] > 0 else loss_y).append(run)
+        else:
+            ent_x.append(t); ent_y.append(run)
+    if xs:
+        xs.append(max(ent_x + [xs[-1]])); ys.append(run)      # extend the line to the latest event
+        ax.axhline(0, color=MUTED, linewidth=1, alpha=0.7)
+        ax.plot(xs, ys, color=BLUE, linewidth=2.2, drawstyle="steps-post", zorder=3)
+        ax.fill_between(xs, ys, 0, step="post", where=[y >= 0 for y in ys], color=GREEN, alpha=0.12)
+        ax.fill_between(xs, ys, 0, step="post", where=[y < 0 for y in ys], color=RED, alpha=0.12)
+        ax.scatter(ent_x, ent_y, marker="^", s=46, color="#C9D3E0", edgecolor=BG, linewidth=0.8, zorder=4, label="Entry")
+        ax.scatter(win_x, win_y, marker="o", s=62, color=GREEN, edgecolor=BG, linewidth=1, zorder=5, label="Winning exit")
+        ax.scatter(loss_x, loss_y, marker="o", s=62, color=RED, edgecolor=BG, linewidth=1, zorder=5, label="Losing exit")
+        ax.legend(loc="lower right", bbox_to_anchor=(1, 1.01), frameon=False, labelcolor=TXT, fontsize=10, ncol=3)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+    ax.yaxis.set_major_formatter(_usd)
+    _title(fig, "Cumulative realised PnL", f"Every entry and exit on one line  |  now {_usd(run)}  |  updated {stamp}")
+    fig.savefig(f"{outdir}/cumulative.png", dpi=150, facecolor=BG); plt.close(fig)
+
+    # per-token realised totals
+    tot = {}
+    for e in events:
+        if e["type"] == "Exit":
+            n = namef(e["mint"]); tot[n] = tot.get(n, 0) + e["pnl"]
+
+    def bars(fname, title, sub, items, color):
+        fig, ax = plt.subplots(figsize=(8, 5.2))
+        fig.subplots_adjust(left=0.24, right=0.93, top=0.78, bottom=0.10)
+        _style(ax, fig); ax.grid(axis="y", visible=False)
+        if items:
+            names = [n for n, _ in items][::-1]; vals = [v for _, v in items][::-1]
+            ax.barh(names, vals, color=color, height=0.62)
+            span = max(abs(v) for v in vals) or 1
+            for i, v in enumerate(vals):
+                ax.text(v + (span * 0.02 if v >= 0 else -span * 0.02), i, _usd(v), color=TXT,
+                        va="center", ha="left" if v >= 0 else "right", fontsize=10)
+            lo, hi = min(0, min(vals)), max(0, max(vals))
+            ax.set_xlim(lo - span * 0.25 * (lo < 0), hi + span * 0.25)
+            ax.xaxis.set_major_formatter(_usd)
+        else:
+            ax.text(0.5, 0.5, "Nothing to show yet", color=MUTED, ha="center", va="center", transform=ax.transAxes)
+            ax.set_xticks([]); ax.set_yticks([])
+        ax.tick_params(axis="y", colors=TXT, labelsize=11)
+        _title(fig, title, sub)
+        fig.savefig(f"{outdir}/{fname}", dpi=150, facecolor=BG); plt.close(fig)
+
+    gains = sorted([(n, v) for n, v in tot.items() if v > 0], key=lambda x: -x[1])[:8]
+    losses = sorted([(n, v) for n, v in tot.items() if v < 0], key=lambda x: x[1])[:8]
+    bars("gainers.png", "Top gainers", "Realised PnL by token", gains, GREEN)
+    bars("losers.png", "Biggest losses", "Realised PnL by token", losses, RED)
+
+    # 4. open positions worth more than $2
+    big = sorted([r for r in open_rows if (r["value"] or 0) > 2], key=lambda r: -r["value"])
+    fig, ax = plt.subplots(figsize=(8, 5.2))
+    fig.subplots_adjust(left=0.24, right=0.93, top=0.78, bottom=0.10)
+    _style(ax, fig); ax.grid(axis="y", visible=False)
+    if big:
+        names = [r["name"] for r in big][::-1]
+        ax.barh(names, [r["cost"] for r in big][::-1], color=GRID, height=0.62, label="Cost")
+        ax.barh(names, [r["value"] for r in big][::-1], color=BLUE, height=0.34, label="Value now")
+        for i, r in enumerate(big[::-1]):
+            ax.text(max(r["value"], r["cost"]) * 1.03, i, f"{_usd(r['value'])}  ({_usd(r['upnl'])})",
+                    color=GREEN if r["upnl"] >= 0 else RED, va="center", fontsize=10)
+        ax.set_xlim(0, max(max(r["value"], r["cost"]) for r in big) * 1.6)
+        ax.xaxis.set_major_formatter(_usd)
+        ax.legend(loc="lower right", frameon=False, labelcolor=TXT, fontsize=10)
+    else:
+        ax.text(0.5, 0.5, "No open position above \\$2", color=MUTED, ha="center", va="center", transform=ax.transAxes)
+        ax.set_xticks([]); ax.set_yticks([])
+    ax.tick_params(axis="y", colors=TXT, labelsize=11)
+    _title(fig, "Open positions over \\$2", f"Current value vs cost  |  updated {stamp}")
+    fig.savefig(f"{outdir}/open.png", dpi=150, facecolor=BG); plt.close(fig)
+
+
+def refresh_page(kpi_text, names):
+    """Update the 'Dashboard summary' callout and point the chart image blocks at the newest PNGs."""
+    repo = os.environ.get("GITHUB_REPOSITORY", "Knee-Surgery/trade-journal")
+    base = f"https://raw.githubusercontent.com/{repo}/main/charts"
+    v = int(time.time())
+    def walk(block_id, depth=0):
+        r = requests.get(f"https://api.notion.com/v1/blocks/{block_id}/children",
+                         headers=NOTION, params={"page_size": 100}, timeout=30)
+        r.raise_for_status()
+        for b in r.json()["results"]:
+            t = b["type"]
+            if t == "callout":
+                first = "".join(x["plain_text"] for x in b["callout"]["rich_text"])
+                if first.startswith("Dashboard summary"):
+                    requests.patch(f"https://api.notion.com/v1/blocks/{b['id']}", headers=NOTION, timeout=30,
+                                   json={"callout": {"rich_text": [{"text": {"content": kpi_text}}]}}).raise_for_status()
+            elif t == "image":
+                cap = "".join(x["plain_text"] for x in b["image"].get("caption", []))
+                key = cap.strip().split(":", 1)[-1] if cap.startswith("chart:") else None
+                if key in names:
+                    requests.patch(f"https://api.notion.com/v1/blocks/{b['id']}", headers=NOTION, timeout=30,
+                                   json={"image": {"external": {"url": f"{base}/{names[key]}?v={v}"}}}).raise_for_status()
+            if depth < 3 and t in ("column_list", "column"):
+                walk(b["id"], depth + 1)
+    walk(PAGE_ID)
+
+
 def main():
     if not HELIUS_KEY or not os.environ.get("NOTION_TOKEN"):
         sys.exit("Set HELIUS_API_KEY and NOTION_TOKEN")
@@ -437,6 +577,27 @@ def main():
     wins = sum(x for x in exits if x > 0)
     losses = -sum(x for x in exits if x <= 0)
     update_breakeven(wins - losses, wins, losses, unreal)
+
+    # dashboard images + summary (never allowed to break the sync)
+    try:
+        rows, open_val = [], 0.0
+        for mint, p in open_pos.items():
+            now = px.get(mint)
+            val = now * p["qty"] if now else 0.0
+            open_val += val
+            rows.append(dict(name=symbol(mint), value=val, cost=p["cost"],
+                             upnl=(val - p["cost"]) if now else 0.0))
+        make_charts(events, rows, symbol, "charts")
+        n_exits = len(exits)
+        wr = (sum(1 for x in exits if x > 0) / n_exits * 100) if n_exits else 0
+        kpi = (f"Dashboard summary | Net realised PnL {money(wins - losses)} | Total won {money(wins)} | "
+               f"Total lost {money(-losses)} | Win rate {wr:.0f}% ({n_exits} exits) | "
+               f"Unrealised PnL {money(unreal)} | Open value {money(open_val)} across {len(open_pos)} positions | "
+               f"Updated {datetime.now(timezone.utc).strftime('%d %b %Y %H:%M UTC')}")
+        refresh_page(kpi, {"cumulative": "cumulative.png", "gainers": "gainers.png",
+                           "losers": "losers.png", "open": "open.png"})
+    except Exception as ex:
+        print("chart step skipped:", repr(ex))
     print(f"events={len(events)} closed={len(closed)} open={len(open_pos)} "
           f"net_realised={wins - losses:.2f} unrealised={unreal:.2f}")
 

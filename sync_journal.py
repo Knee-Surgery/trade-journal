@@ -588,6 +588,11 @@ def main():
             rows.append(dict(name=symbol(mint), value=val, cost=p["cost"],
                              upnl=(val - p["cost"]) if now else 0.0))
         make_charts(events, rows, symbol, "charts")
+        import shutil   # dated daily snapshot: the last run of each day is the one kept
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        os.makedirs(f"charts/history/{day}", exist_ok=True)
+        for f in ("cumulative", "gainers", "losers", "open"):
+            shutil.copy(f"charts/{f}.png", f"charts/history/{day}/{f}.png")
         n_exits = len(exits)
         wr = (sum(1 for x in exits if x > 0) / n_exits * 100) if n_exits else 0
         kpi = (f"Dashboard summary | Net realised PnL {money(wins - losses)} | Total won {money(wins)} | "

@@ -1,29 +1,38 @@
 name: Sync trade journal
+# Each run stays alive for ~5h40m, syncing Notion every minute, then starts the next run itself.
+# The hourly schedule only restarts the chain if it ever breaks (extra runs just wait in the queue).
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "17 * * * *"
   workflow_dispatch:
 permissions:
   contents: write
+  actions: write
 concurrency:
   group: sync
   cancel-in-progress: false
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 358
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install requests matplotlib
-      - run: python sync_journal.py
+      - run: |
+          git config user.name "trade-journal-bot"
+          git config user.email "bot@users.noreply.github.com"
+      - run: python -u sync_journal.py
         env:
           HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-      - name: Commit charts
-        run: |
-          git config user.name "trade-journal-bot"
-          git config user.email "bot@users.noreply.github.com"
-          git add charts
-          git diff --cached --quiet || (git commit -m "Update charts" && git push)
+          LOOP_MINUTES: "340"
+          EVERY_SECONDS: "60"
+          CHART_MINUTES: "15"
+      - name: Start the next run
+        if: ${{ !cancelled() }}   # cancelling a run in the Actions tab stops the chain
+        run: gh workflow run sync.yml --ref main -R "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ github.token }}

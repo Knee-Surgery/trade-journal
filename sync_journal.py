@@ -30,7 +30,8 @@ DUST = 1e-9
 
 
 # ---------- data fetch ----------
-def fetch_swaps():
+def fetch_swaps(known=()):
+    """Wallet history, newest first from Helius. Stops paging at the first already-known signature."""
     out, before = [], None
     while True:
         url = f"https://api.helius.xyz/v0/addresses/{WALLET}/transactions"
@@ -42,9 +43,22 @@ def fetch_swaps():
         batch = r.json()
         if not batch:
             break
-        out += batch
+        new = [t for t in batch if t["signature"] not in known]
+        out += new
+        if len(new) < len(batch):
+            break
         before = batch[-1]["signature"]
     return sorted(out, key=lambda t: t["timestamp"])
+
+
+def latest_signature():
+    """Newest wallet signature via plain RPC: a cheap 'anything new?' check before the full fetch."""
+    r = requests.post(f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}", timeout=20, json={
+        "jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
+        "params": [WALLET, {"limit": 1}]})
+    r.raise_for_status()
+    res = r.json().get("result") or []
+    return res[0]["signature"] if res else None
 
 
 _sol_cache = {}
@@ -290,14 +304,17 @@ def n_archive(page_id):
 def money(x):
     return f"-${abs(x):,.2f}" if x < 0 else f"${x:,.2f}"
 
-def update_breakeven(net, wins, losses, unreal):
+def pct(x):
+    return "n/a" if x is None else f"{x * 100:+.2f}%"
+
+def update_breakeven(net, wins, losses, unreal, net_pct=None, unreal_pct=None):
     """Rewrite the 'Breakeven tracker' callout on the journal page."""
     need = max(0.0, -net)
     net_all = net + unreal
     need_all = max(0.0, -net_all)
-    txt = (f"Breakeven tracker: net realised PnL {money(net)} (wins {money(wins)}, "
+    txt = (f"Breakeven tracker: net realised PnL {money(net)} ({pct(net_pct)}) (wins {money(wins)}, "
            f"losses {money(-losses)}). Needed in winning exits to turn positive: {money(need)}. "
-           f"Counting open positions at current prices ({money(unreal)}): "
+           f"Counting open positions at current prices ({money(unreal)}, {pct(unreal_pct)}): "
            f"net {money(net_all)}, needed {money(need_all)}.")
     def find(block_id, depth=0):
         r = requests.get(f"https://api.notion.com/v1/blocks/{block_id}/children",
@@ -537,21 +554,17 @@ def refresh_page(kpi_text, names):
     walk(PAGE_ID)
 
 
-def main():
-    if not HELIUS_KEY or not os.environ.get("NOTION_TOKEN"):
-        sys.exit("Set HELIUS_API_KEY and NOTION_TOKEN")
-    txs = fetch_swaps()
-    types = {}
-    for t in txs:
-        types[t.get("type")] = types.get(t.get("type"), 0) + 1
-    print(f"fetched {len(txs)} txs; types={types}")
-    if txs:
-        print(f"range {iso(txs[0]['timestamp'])} -> {iso(txs[-1]['timestamp'])}")
-    events, closed, open_pos = to_trades(txs)
-
-    # events (append-only, keyed by signature)
-    have = {"".join(t["plain_text"] for t in p["properties"]["Tx Signature"]["rich_text"])
-            for p in n_query(DB_EVENTS)}
+def sync_history(events, closed):
+    """Append new rows to Trade Events, Wins/Losses and Closed Trades (keyed by tx), then self-heal names."""
+    # events (append-only, keyed by signature); exits missing a PnL % get it filled in
+    by_sig = {e["sig"]: e for e in events}
+    have = set()
+    for p in n_query(DB_EVENTS):
+        sig = plain(p["properties"]["Tx Signature"], "rich_text")
+        have.add(sig)
+        e = by_sig.get(sig)
+        if e and e["type"] == "Exit" and e["cost"] and (p["properties"].get("PnL %") or {}).get("number") is None:
+            n_patch(p["id"], {"PnL %": num(e["pnl"] / e["cost"])})
     cum = 0.0
     for e in events:
         if e["type"] == "Exit": cum = e["cum"]
@@ -562,6 +575,7 @@ def main():
             "Type": {"select": {"name": e["type"]}}, "Token": text(sym),
             "Price (USD)": num(e["price"]),
             "Realised PnL (USD)": num(e["pnl"]),
+            "PnL %": num(e["pnl"] / e["cost"] if e["type"] == "Exit" and e["cost"] else None),
             "Cumulative PnL (USD)": num(cum if e["type"] == "Exit" else None),
             "Tx": {"url": solscan(e["sig"])}, "Tx Signature": text(e["sig"])})
 
@@ -594,73 +608,167 @@ def main():
             "Result": {"select": {"name": "Win" if c["pnl"] > 0 else "Loss" if c["pnl"] < 0 else "Breakeven"}},
             "Hold Time (hrs)": num((c["exit_ts"] - c["entry_ts"]) / 3600),
             "Entry Tx": {"url": solscan(c["entry_sig"])}, "Exit Tx": {"url": solscan(c["exit_sig"])}})
+    rename_pass(events)
 
-    # open trades: refresh fully each run (prices change); quantities verified against the wallet
+
+def sync_open(open_pos):
+    """Update Open Trades in place with live prices: patch existing rows, add new ones, archive sold ones.
+    Returns (rows for charts, unrealised PnL, cost of priced positions, open value)."""
     open_pos = reconcile(open_pos)
     px = prices_now(open_pos.keys())
+    existing, dupes = {}, []
+    for p in n_query(DB_OPEN):
+        m = plain(p["properties"]["Mint"], "rich_text")
+        if m and m not in existing:
+            existing[m] = p
+        else:
+            dupes.append(p)
     for m in list(open_pos):                      # holdings with no trade history: only keep real ones
         p = open_pos[m]
         if p.get("untracked"):
             now = px.get(m)
             if not now or now * p["qty"] < 0.10:
                 del open_pos[m]; continue
-            p["cost"] = now * p["qty"]            # true cost unknown: PnL starts from now
-            print(f"untracked holding {symbol(m)}: {p['qty']:.4f} tokens = ${p['cost']:.2f}")
-    for p in n_query(DB_OPEN): n_archive(p["id"])
-    unreal = 0.0
+            row = existing.get(m)
+            first = row["properties"]["Entry Price (USD)"].get("number") if row else None
+            if first:                             # keep the price from when it was first seen
+                p["cost"] = first * p["qty"]
+                start = (row["properties"]["Entry Time"].get("date") or {}).get("start")
+                if start: p["entry_ts"] = int(datetime.fromisoformat(start).timestamp())
+            else:
+                p["cost"] = now * p["qty"]        # true cost unknown: PnL starts from now
+                print(f"untracked holding {symbol(m)}: {p['qty']:.4f} tokens = ${p['cost']:.2f}")
     unpriced = [symbol(m) for m in open_pos if m not in px]
     if unpriced:
         print("no price found for:", ", ".join(unpriced))
+    unreal = cost_priced = open_val = 0.0
+    rows = []
     for mint, p in open_pos.items():
         entry = p["cost"] / p["qty"]
         now = px.get(mint)
-        upnl = (now - entry) * p["qty"] if now else None
-        if upnl is not None: unreal += upnl
+        val = now * p["qty"] if now else None
+        upnl = val - p["cost"] if now else None
+        if upnl is not None:
+            unreal += upnl; cost_priced += p["cost"]; open_val += val
+        rows.append(dict(name=symbol(mint), value=val or 0.0, cost=p["cost"], upnl=upnl or 0.0))
         props = {
             "Token": title(symbol(mint)), "Mint": text(mint), "Entry Time": date(p["entry_ts"]),
             "Entry Price (USD)": num(entry), "Size (Tokens)": num(p["qty"]),
             "Cost Basis (USD)": num(p["cost"]), "Current Price (USD)": num(now),
-            "Current Value (USD)": num(now * p["qty"] if now else None),
+            "Current Value (USD)": num(val),
             "Unrealised PnL (USD)": num(upnl),
             "Unrealised PnL %": num(upnl / p["cost"] if upnl is not None and p["cost"] else None)}
         if p.get("entry_sig"):
             props["Entry Tx"] = {"url": solscan(p["entry_sig"])}
         if p.get("untracked"):
             props["Notes"] = text("Bought outside tracked history: cost basis set at the price when first seen")
-        n_create(DB_OPEN, props)
-    rename_pass(events)
-    exits = [e["pnl"] for e in events if e["type"] == "Exit"]
-    wins = sum(x for x in exits if x > 0)
-    losses = -sum(x for x in exits if x <= 0)
-    update_breakeven(wins - losses, wins, losses, unreal)
+        row = existing.pop(mint, None)
+        if row: n_patch(row["id"], props)
+        else: n_create(DB_OPEN, props)
+    for row in list(existing.values()) + dupes:   # positions no longer held
+        n_archive(row["id"])
+    return rows, unreal, cost_priced, open_val
 
-    # dashboard images + summary (never allowed to break the sync)
+
+def commit_charts():
+    """On GitHub Actions, push the refreshed PNGs so Notion's image links pick them up."""
+    if not os.environ.get("GITHUB_ACTIONS"):
+        return
+    import subprocess
+    def git(*a): return subprocess.run(["git", *a], capture_output=True, text=True)
+    git("add", "charts")
+    if git("diff", "--cached", "--quiet").returncode == 0:
+        return
+    git("commit", "-m", "Update charts")
+    for _ in range(3):
+        git("pull", "--rebase", "-X", "theirs")
+        r = git("push")
+        if r.returncode == 0: return
+        time.sleep(5)
+    print("chart push failed:", r.stderr.strip())
+
+
+def tick(state, charts):
+    """One sync pass. Trade history is re-read only when the wallet has a new transaction."""
     try:
-        rows, open_val = [], 0.0
-        for mint, p in open_pos.items():
-            now = px.get(mint)
-            val = now * p["qty"] if now else 0.0
-            open_val += val
-            rows.append(dict(name=symbol(mint), value=val, cost=p["cost"],
-                             upnl=(val - p["cost"]) if now else 0.0))
-        make_charts(events, rows, symbol, "charts")
-        import shutil   # dated daily snapshot: the last run of each day is the one kept
-        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        os.makedirs(f"charts/history/{day}", exist_ok=True)
-        for f in ("cumulative", "gainers", "losers", "open"):
-            shutil.copy(f"charts/{f}.png", f"charts/history/{day}/{f}.png")
-        n_exits = len(exits)
-        wr = (sum(1 for x in exits if x > 0) / n_exits * 100) if n_exits else 0
-        kpi = (f"Dashboard summary | Net realised PnL {money(wins - losses)} | Total won {money(wins)} | "
-               f"Total lost {money(-losses)} | Win rate {wr:.0f}% ({n_exits} exits) | "
-               f"Unrealised PnL {money(unreal)} | Open value {money(open_val)} across {len(open_pos)} positions | "
-               f"Updated {datetime.now(timezone.utc).strftime('%d %b %Y %H:%M UTC')}")
-        refresh_page(kpi, {"cumulative": "cumulative.png", "gainers": "gainers.png",
-                           "losers": "losers.png", "open": "open.png"})
+        sig = latest_signature()
     except Exception as ex:
-        print("chart step skipped:", repr(ex))
-    print(f"events={len(events)} closed={len(closed)} open={len(open_pos)} "
-          f"net_realised={wins - losses:.2f} unrealised={unreal:.2f}")
+        print("signature check failed:", repr(ex)); sig = state.get("sig")
+    fresh = "events" not in state or sig != state.get("sig")
+    if fresh:
+        new = fetch_swaps({t["signature"] for t in state.get("txs", [])})
+        state["txs"] = sorted(state.get("txs", []) + new, key=lambda t: t["timestamp"])
+        print(f"{len(new)} new txs ({len(state['txs'])} total)")
+        state["events"], state["closed"], state["open"] = to_trades(state["txs"])
+        sync_history(state["events"], state["closed"])
+        state["sig"] = sig
+    events = state["events"]
+    rows, unreal, cost_priced, open_val = sync_open(state["open"])
+
+    exits = [e for e in events if e["type"] == "Exit"]
+    wins = sum(e["pnl"] for e in exits if e["pnl"] > 0)
+    losses = -sum(e["pnl"] for e in exits if e["pnl"] <= 0)
+    net = wins - losses
+    exit_cost = sum(e["cost"] for e in exits)
+    net_pct = net / exit_cost if exit_cost else None
+    unreal_pct = unreal / cost_priced if cost_priced else None
+    total_pct = (net + unreal) / (exit_cost + cost_priced) if exit_cost + cost_priced else None
+    update_breakeven(net, wins, losses, unreal, net_pct, unreal_pct)
+
+    names = {}
+    if charts or fresh:                           # chart images: on new trades and every CHART_MINUTES
+        try:
+            make_charts(events, rows, symbol, "charts")
+            import shutil   # dated daily snapshot: the last run of each day is the one kept
+            day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            os.makedirs(f"charts/history/{day}", exist_ok=True)
+            for f in ("cumulative", "gainers", "losers", "open"):
+                shutil.copy(f"charts/{f}.png", f"charts/history/{day}/{f}.png")
+            commit_charts()
+            names = {k: f"{k}.png" for k in ("cumulative", "gainers", "losers", "open")}
+        except Exception as ex:
+            print("chart step skipped:", repr(ex))
+    n_exits = len(exits)
+    wr = (sum(1 for e in exits if e["pnl"] > 0) / n_exits * 100) if n_exits else 0
+    kpi = (f"Dashboard summary | Net realised PnL {money(net)} ({pct(net_pct)}) | Total won {money(wins)} | "
+           f"Total lost {money(-losses)} | Win rate {wr:.0f}% ({n_exits} exits) | "
+           f"Unrealised PnL {money(unreal)} ({pct(unreal_pct)}) | "
+           f"Total PnL {money(net + unreal)} ({pct(total_pct)}) | "
+           f"Open value {money(open_val)} across {len(rows)} positions | "
+           f"Updated {datetime.now(timezone.utc).strftime('%d %b %Y %H:%M:%S UTC')}")
+    try:
+        refresh_page(kpi, names)
+    except Exception as ex:
+        print("summary update skipped:", repr(ex))
+    print(f"{datetime.now(timezone.utc):%H:%M:%S} events={len(events)} open={len(rows)} "
+          f"net_realised={net:.2f} ({pct(net_pct)}) unrealised={unreal:.2f} ({pct(unreal_pct)})")
+
+
+def main():
+    if not HELIUS_KEY or not os.environ.get("NOTION_TOKEN"):
+        sys.exit("Set HELIUS_API_KEY and NOTION_TOKEN")
+    loop_min = float(os.environ.get("LOOP_MINUTES", "0"))      # 0 = run once
+    every = float(os.environ.get("EVERY_SECONDS", "60"))
+    chart_every = float(os.environ.get("CHART_MINUTES", "15")) * 60
+    end = time.time() + loop_min * 60
+    state, last_chart, fails = {}, 0.0, 0
+    while True:
+        started = time.time()
+        charts = started - last_chart >= chart_every
+        try:
+            tick(state, charts)
+            fails = 0
+            if charts: last_chart = started
+        except Exception as ex:                    # network blips must not end a long run
+            fails += 1
+            print("sync pass failed:", repr(ex))
+            if not loop_min or fails >= 10: raise
+        if time.time() + every > end:
+            break
+        time.sleep(max(0.0, every - (time.time() - started)))
+    if loop_min and time.time() - last_chart > 60:  # leave fresh charts behind for the next run
+        try: tick(state, True)
+        except Exception as ex: print("final pass failed:", repr(ex))
 
 
 if __name__ == "__main__":

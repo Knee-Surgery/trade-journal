@@ -8,6 +8,7 @@ import os, re, sys, time, requests
 from datetime import datetime, timezone
 
 WALLET = "Eiozy5kVAvzrY5h7juAREHa6B3qVsfYL246hQh4GJumq"
+OTHER_WALLET = "77p7fw49wuZzuQNLomnBZFZ5dUvntW243jiBVnrNJSz9"   # the user's other wallet; transfers shown separately
 DB_EVENTS = "900ea75d-b46a-40cb-b35f-8703162a1c2f"
 DB_OPEN = "5289c2ff-da55-421d-b27e-c2ca26314241"
 DB_CLOSED = "0f6f708e-8a63-4682-8bbe-2029dcf39a17"
@@ -390,10 +391,44 @@ def onchain_balances():
     return out
 
 
+_last_bal = {}
+
+def flows(txs):
+    """Money moved in and out of the wallet (not trades): txs where only SOL/stables move.
+    Returns {"in": usd, "out": usd, "other_in": usd, "other_out": usd} (other_* = with OTHER_WALLET)."""
+    f = {"in": 0.0, "out": 0.0, "other_in": 0.0, "other_out": 0.0}
+    for tx in txs:
+        spent, got = legs(tx)
+        if any(m != SOL and m not in STABLES for m in list(spent) + list(got)):
+            continue                                       # a token moved: that's a trade, not a transfer
+        usd = sum(usd_value(m, a, tx["timestamp"]) or 0 for m, a in got.items()) \
+            - sum(usd_value(m, a, tx["timestamp"]) or 0 for m, a in spent.items())
+        if abs(usd) < 0.50:
+            continue                                       # rent refunds, fees and dust
+        parties = {t.get("fromUserAccount") for t in (tx.get("nativeTransfers") or []) + (tx.get("tokenTransfers") or [])} \
+                | {t.get("toUserAccount") for t in (tx.get("nativeTransfers") or []) + (tx.get("tokenTransfers") or [])}
+        key = "in" if usd > 0 else "out"
+        f[key] += abs(usd)
+        if OTHER_WALLET in parties:
+            f["other_" + key] += abs(usd)
+    return f
+
+
+def wallet_cash():
+    """USD value of the SOL and stablecoins sitting in the wallet now."""
+    r = requests.post(f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}", timeout=20, json={
+        "jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [WALLET]})
+    r.raise_for_status()
+    sol = r.json()["result"]["value"] / 1e9
+    px = prices_now([SOL]).get(SOL) or 0.0
+    return sol * px + sum(q for m, q in _last_bal.items() if m in STABLES)
+
+
 def reconcile(open_pos):
     """Make holdings match the wallet. Quantities come from the chain; cost basis from the trade history."""
+    global _last_bal
     try:
-        bal = onchain_balances()
+        bal = _last_bal = onchain_balances()
     except Exception as ex:
         print("balance check failed, using tracked quantities:", repr(ex))
         return open_pos
@@ -701,9 +736,15 @@ def tick(state, charts):
         print(f"{len(new)} new txs ({len(state['txs'])} total)")
         state["events"], state["closed"], state["open"] = to_trades(state["txs"])
         sync_history(state["events"], state["closed"])
+        state["flows"] = flows(state["txs"])
         state["sig"] = sig
     events = state["events"]
     rows, unreal, cost_priced, open_val = sync_open(state["open"])
+    fl = state["flows"]
+    try:
+        cash = wallet_cash()
+    except Exception as ex:
+        print("cash check failed:", repr(ex)); cash = None
 
     exits = [e for e in events if e["type"] == "Exit"]
     wins = sum(e["pnl"] for e in exits if e["pnl"] > 0)
@@ -734,14 +775,40 @@ def tick(state, charts):
            f"Total lost {money(-losses)} | Win rate {wr:.0f}% ({n_exits} exits) | "
            f"Unrealised PnL {money(unreal)} ({pct(unreal_pct)}) | "
            f"Total PnL {money(net + unreal)} ({pct(total_pct)}) | "
-           f"Open value {money(open_val)} across {len(rows)} positions | "
-           f"Updated {datetime.now(timezone.utc).strftime('%d %b %Y %H:%M:%S UTC')}")
+           f"Open value {money(open_val)} across {len(rows)} positions | ")
+    if cash is not None:
+        value = open_val + cash
+        wpnl = value + fl["out"] - fl["in"]
+        kpi += (f"Wallet PnL (value now + withdrawn - deposited) {money(wpnl)} "
+                f"({pct(wpnl / fl['in'] if fl['in'] else None)}) | Wallet value {money(value)} "
+                f"(cash {money(cash)}) | Deposited {money(fl['in'])} | Withdrawn {money(fl['out'])} | "
+                f"With 77p7 wallet: received {money(fl['other_in'])}, sent {money(fl['other_out'])} | ")
+        print(f"wallet: value={value:.2f} cash={cash:.2f} flows={fl} pnl={wpnl:.2f}")
+    kpi += (f"Updated {datetime.now(timezone.utc).strftime('%d %b %Y %H:%M:%S UTC')}")
     try:
         refresh_page(kpi, names)
     except Exception as ex:
         print("summary update skipped:", repr(ex))
     print(f"{datetime.now(timezone.utc):%H:%M:%S} events={len(events)} open={len(rows)} "
           f"net_realised={net:.2f} ({pct(net_pct)}) unrealised={unreal:.2f} ({pct(unreal_pct)})")
+
+
+_code_check = {"at": time.time(), "start": None}
+def code_changed():
+    """On Actions, every 5 minutes: has the script or workflow changed on main? Then end early so
+    the next run (started by the workflow) uses the new code."""
+    if not os.environ.get("GITHUB_ACTIONS") or time.time() - _code_check["at"] < 300:
+        return False
+    _code_check["at"] = time.time()
+    import subprocess
+    if not _code_check["start"]:   # the commit this run started from (HEAD moves when charts are pushed)
+        _code_check["start"] = os.environ.get("GITHUB_SHA") or "HEAD"
+    if subprocess.run(["git", "fetch", "-q", "origin", "main"], capture_output=True).returncode:
+        return False
+    changed = subprocess.run(["git", "diff", "--quiet", _code_check["start"], "origin/main", "--",
+                              "sync_journal.py", ".github"]).returncode != 0
+    if changed: print("new code on main: ending this run so the next one picks it up")
+    return changed
 
 
 def main():
@@ -763,7 +830,7 @@ def main():
             fails += 1
             print("sync pass failed:", repr(ex))
             if not loop_min or fails >= 10: raise
-        if time.time() + every > end:
+        if time.time() + every > end or code_changed():
             break
         time.sleep(max(0.0, every - (time.time() - started)))
     if loop_min and time.time() - last_chart > 60:  # leave fresh charts behind for the next run

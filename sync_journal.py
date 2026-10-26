@@ -423,6 +423,8 @@ def flows(txs):
                 | {t.get("toUserAccount") for t in (tx.get("nativeTransfers") or []) + (tx.get("tokenTransfers") or [])}
         key = "in" if usd > 0 else "out"
         f[key] += abs(usd)
+        print(f"flow {key} {usd:+.2f} {'77p7 ' if OTHER_WALLET in parties else ''}{iso(tx['timestamp'])} "
+              f"type={tx.get('type')} source={tx.get('source')} spent={spent} got={got} {tx['signature']}")
         if OTHER_WALLET in parties:
             f["other_" + key] += abs(usd)
     return f

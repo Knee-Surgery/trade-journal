@@ -148,6 +148,32 @@ def usd_value(mint, amt, ts):
     return None
 
 
+def trade_audit(txs):
+    """Debug: how every tx that moves a non-quote token gets classified."""
+    held, tot = {}, {}
+    for tx in txs:
+        spent, got = legs(tx)
+        q_s = {m: a for m, a in spent.items() if m == SOL or m in STABLES}
+        q_g = {m: a for m, a in got.items() if m == SOL or m in STABLES}
+        t_s = {m: a for m, a in spent.items() if m != SOL and m not in STABLES}
+        t_g = {m: a for m, a in got.items() if m != SOL and m not in STABLES}
+        if not (t_s or t_g):
+            continue
+        if q_s and t_g: kind = "BUY"
+        elif q_g and t_s: kind = "SELL" if held.get(next(iter(t_s)), 0) > DUST else "SELL-SKIPPED"
+        else: kind = "OTHER"
+        for m, a in t_g.items(): held[m] = held.get(m, 0) + a
+        for m, a in t_s.items(): held[m] = held.get(m, 0) - a
+        usd = sum(usd_value(m, a, tx["timestamp"]) or 0 for m, a in q_g.items()) \
+            - sum(usd_value(m, a, tx["timestamp"]) or 0 for m, a in q_s.items())
+        s = tot.setdefault(kind, [0, 0.0]); s[0] += 1; s[1] += usd
+        short = lambda d: {(symbol(m) if m != SOL else "SOL"): round(a, 4) for m, a in d.items()}
+        print(f"trade-audit {kind} {iso(tx['timestamp'])} type={tx.get('type')} source={tx.get('source')} "
+              f"usd={usd:+.2f} spent={short(spent)} got={short(got)} {tx['signature'][:12]}")
+    for k, (n, usd) in sorted(tot.items()):
+        print(f"trade-audit total {k}: {n} txs, quote flow {usd:+.2f}")
+
+
 def to_trades(txs):
     """Walk swaps in time order -> events, closed trades, open positions."""
     pos = {}      # mint -> {qty, cost, entry_ts, entry_sig, entry_price0}
@@ -791,6 +817,9 @@ def tick(state, charts):
         new = fetch_swaps({t["signature"] for t in state.get("txs", [])})
         state["txs"] = sorted(state.get("txs", []) + new, key=lambda t: t["timestamp"])
         print(f"{len(new)} new txs ({len(state['txs'])} total)")
+        if "events" not in state:
+            try: trade_audit(state["txs"])
+            except Exception as ex: print("trade audit failed:", repr(ex))
         state["events"], state["closed"], state["open"] = to_trades(state["txs"])
         sync_history(state["events"], state["closed"])
         try:

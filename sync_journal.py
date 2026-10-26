@@ -148,36 +148,10 @@ def usd_value(mint, amt, ts):
     return None
 
 
-def trade_audit(txs):
-    """Debug: how every tx that moves a non-quote token gets classified."""
-    held, tot = {}, {}
-    for tx in txs:
-        spent, got = legs(tx)
-        q_s = {m: a for m, a in spent.items() if m == SOL or m in STABLES}
-        q_g = {m: a for m, a in got.items() if m == SOL or m in STABLES}
-        t_s = {m: a for m, a in spent.items() if m != SOL and m not in STABLES}
-        t_g = {m: a for m, a in got.items() if m != SOL and m not in STABLES}
-        if not (t_s or t_g):
-            continue
-        if q_s and t_g: kind = "BUY"
-        elif q_g and t_s: kind = "SELL" if held.get(next(iter(t_s)), 0) > DUST else "SELL-SKIPPED"
-        else: kind = "OTHER"
-        for m, a in t_g.items(): held[m] = held.get(m, 0) + a
-        for m, a in t_s.items(): held[m] = held.get(m, 0) - a
-        usd = sum(usd_value(m, a, tx["timestamp"]) or 0 for m, a in q_g.items()) \
-            - sum(usd_value(m, a, tx["timestamp"]) or 0 for m, a in q_s.items())
-        s = tot.setdefault(kind, [0, 0.0]); s[0] += 1; s[1] += usd
-        short = lambda d: {(symbol(m) if m != SOL else "SOL"): round(a, 4) for m, a in d.items()}
-        print(f"trade-audit {kind} {iso(tx['timestamp'])} type={tx.get('type')} source={tx.get('source')} "
-              f"usd={usd:+.2f} spent={short(spent)} got={short(got)} {tx['signature'][:12]}")
-    for k, (n, usd) in sorted(tot.items()):
-        print(f"trade-audit total {k}: {n} txs, quote flow {usd:+.2f}")
-
-
 def to_trades(txs):
     """Walk swaps in time order -> events, closed trades, open positions."""
     pos = {}      # mint -> {qty, cost, entry_ts, entry_sig, entry_price0}
-    events, closed = [], []
+    events, closed, in_kind = [], [], []
     cum = 0.0
     for tx in txs:
         spent, got = legs(tx)
@@ -203,10 +177,19 @@ def to_trades(txs):
                                price=usd / qty if qty else 0, pnl=None))
         elif quote_got and tok_spent:                     # SELL
             mint, qty = tok_spent[0]
-            p = pos.get(mint)
-            if not p or p["qty"] <= DUST:
-                continue                                   # sold something bought before history window
             usd = sum(usd_value(m, a, ts) or 0 for m, a in quote_got)
+            p = pos.setdefault(mint, {"qty": 0.0, "cost": 0.0, "entry_ts": ts,
+                                      "entry_sig": sig, "first_cost": 0.0, "first_qty": 0.0})
+            if p["qty"] <= DUST:
+                p.update(qty=0.0, cost=0.0, entry_ts=ts, entry_sig=sig, first_cost=0.0, first_qty=0.0)
+            if qty > p["qty"] + DUST:
+                # Part of what was sold never arrived through a buy here: it was sent in from
+                # another wallet. Count it as a deposit at the sale price, so it makes no profit.
+                extra = qty - p["qty"]
+                gift = usd * extra / qty if qty else 0.0
+                in_kind.append(dict(sig=sig, ts=ts, mint=mint, qty=extra, usd=gift))
+                p["qty"] += extra; p["cost"] += gift
+                p["first_qty"] += extra; p["first_cost"] += gift
             sell_qty = min(qty, p["qty"])
             avg = p["cost"] / p["qty"]
             realised = usd * (sell_qty / qty) - avg * sell_qty
@@ -238,7 +221,7 @@ def to_trades(txs):
                     p.pop(k, None)
                 p["qty"] = 0.0
     open_pos = {m: p for m, p in pos.items() if p["qty"] > DUST}
-    return events, closed, open_pos
+    return events, closed, open_pos, in_kind
 
 
 # ---------- helpers ----------
@@ -523,7 +506,8 @@ def reconcile(open_pos):
         if p:
             if abs(q - p["qty"]) > max(1e-6 * p["qty"], 1e-9):
                 print(f"qty fixed {symbol(m)}: tracked {p['qty']:.6f} -> on-chain {q:.6f}")
-            res[m] = dict(p, cost=p["cost"] / p["qty"] * q, qty=q)
+            res[m] = dict(p, cost=p["cost"] / p["qty"] * q, qty=q,
+                          sent_in=max(0.0, q - p["qty"]) * p["cost"] / p["qty"])   # extra tokens arrived from elsewhere
         else:
             res[m] = dict(qty=q, cost=None, entry_ts=int(time.time()), entry_sig=None, untracked=True)
     for m in open_pos:
@@ -760,6 +744,7 @@ def sync_open(open_pos):
     if unpriced:
         print("no price found for:", ", ".join(unpriced))
     unreal = cost_priced = open_val = 0.0
+    sent_in = sum(p["cost"] if p.get("untracked") else p.get("sent_in", 0.0) for p in open_pos.values())
     rows = []
     for mint, p in open_pos.items():
         entry = p["cost"] / p["qty"]
@@ -785,7 +770,7 @@ def sync_open(open_pos):
         else: n_create(DB_OPEN, props)
     for row in list(existing.values()) + dupes:   # positions no longer held
         n_archive(row["id"])
-    return rows, unreal, cost_priced, open_val
+    return rows, unreal, cost_priced, open_val, sent_in
 
 
 def commit_charts():
@@ -817,10 +802,7 @@ def tick(state, charts):
         new = fetch_swaps({t["signature"] for t in state.get("txs", [])})
         state["txs"] = sorted(state.get("txs", []) + new, key=lambda t: t["timestamp"])
         print(f"{len(new)} new txs ({len(state['txs'])} total)")
-        if "events" not in state:
-            try: trade_audit(state["txs"])
-            except Exception as ex: print("trade audit failed:", repr(ex))
-        state["events"], state["closed"], state["open"] = to_trades(state["txs"])
+        state["events"], state["closed"], state["open"], state["in_kind"] = to_trades(state["txs"])
         sync_history(state["events"], state["closed"])
         try:
             state["flows"] = flows(state["txs"])
@@ -828,8 +810,9 @@ def tick(state, charts):
             print("deposit/withdrawal step skipped:", repr(ex)); state["flows"] = None
         state["sig"] = sig
     events = state["events"]
-    rows, unreal, cost_priced, open_val = sync_open(state["open"])
+    rows, unreal, cost_priced, open_val, held_sent_in = sync_open(state["open"])
     fl = state["flows"]
+    sent_in = sum(g["usd"] for g in state["in_kind"]) + held_sent_in   # tokens sent in, valued in USD
     try:
         cash = wallet_cash()
     except Exception as ex:
@@ -867,12 +850,14 @@ def tick(state, charts):
            f"Open value {money(open_val)} across {len(rows)} positions | ")
     if cash is not None and fl:
         value = open_val + cash
-        wpnl = value + fl["out"] - fl["in"]
+        deposited = fl["in"] + sent_in
+        wpnl = value + fl["out"] - deposited
         kpi += (f"Wallet PnL (value now + withdrawn - deposited) {money(wpnl)} "
-                f"({pct(wpnl / fl['in'] if fl['in'] else None)}) | Wallet value {money(value)} "
-                f"(cash {money(cash)}) | Deposited {money(fl['in'])} | Withdrawn {money(fl['out'])} | "
+                f"({pct(wpnl / deposited if deposited else None)}) | Wallet value {money(value)} "
+                f"(cash {money(cash)}) | Deposited {money(deposited)} (cash {money(fl['in'])}, "
+                f"tokens sent in {money(sent_in)}) | Withdrawn {money(fl['out'])} | "
                 f"With 77p7 wallet: received {money(fl['other_in'])}, sent {money(fl['other_out'])} | ")
-        print(f"wallet: value={value:.2f} cash={cash:.2f} flows={fl} pnl={wpnl:.2f}")
+        print(f"wallet: value={value:.2f} cash={cash:.2f} flows={fl} sent_in={sent_in:.2f} pnl={wpnl:.2f}")
     kpi += (f"Updated {datetime.now(timezone.utc).strftime('%d %b %Y %H:%M:%S UTC')}")
     try:
         refresh_page(kpi, names)

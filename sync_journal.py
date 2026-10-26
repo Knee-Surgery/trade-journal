@@ -411,8 +411,23 @@ def flows(txs):
     """Money moved in and out of the wallet (not trades): txs where only SOL/stables move.
     Returns {"in": usd, "out": usd, "other_in": usd, "other_out": usd} (other_* = with OTHER_WALLET)."""
     f = {"in": 0.0, "out": 0.0, "other_in": 0.0, "other_out": 0.0}
+    audit = {}
     for tx in txs:
         spent, got = legs(tx)
+        # audit: real stablecoin balance change (from balance diffs) vs what legs() saw
+        real = 0.0
+        for a in tx.get("accountData") or []:
+            for b in a.get("tokenBalanceChanges") or []:
+                if b.get("userAccount") == WALLET and b.get("mint") in STABLES:
+                    raw = b["rawTokenAmount"]
+                    real += int(raw["tokenAmount"]) / 10 ** int(raw["decimals"])
+        seen = sum(got.get(m, 0) for m in STABLES) - sum(spent.get(m, 0) for m in STABLES)
+        kind = "trade" if any(m != SOL and m not in STABLES for m in list(spent) + list(got)) else "transfer"
+        s = audit.setdefault(f"{kind}/{tx.get('type')}", [0, 0.0, 0.0])
+        s[0] += 1; s[1] += real; s[2] += seen
+        if abs(real - seen) > 0.01:
+            print(f"audit mismatch {iso(tx['timestamp'])} type={tx.get('type')} source={tx.get('source')} "
+                  f"real={real:+.4f} seen={seen:+.4f} spent={spent} got={got} {tx['signature']}")
         if any(m != SOL and m not in STABLES for m in list(spent) + list(got)):
             continue                                       # a token moved: that's a trade, not a transfer
         usd = sum(usd_value(m, a, tx["timestamp"]) or 0 for m, a in got.items()) \
@@ -427,6 +442,8 @@ def flows(txs):
               f"type={tx.get('type')} source={tx.get('source')} spent={spent} got={got} {tx['signature']}")
         if OTHER_WALLET in parties:
             f["other_" + key] += abs(usd)
+    for k, (n, real, seen) in sorted(audit.items()):
+        print(f"audit {k}: {n} txs, stablecoin change real={real:+.2f} seen={seen:+.2f}")
     return f
 
 
@@ -798,7 +815,7 @@ def tick(state, charts):
     if cash is not None and fl:
         value = open_val + cash
         wpnl = value + fl["out"] - fl["in"]
-        kpi += (f"Wallet PnL (value now + withdrawn - deposited) {money(wpnl)} "
+        kpi += (f"Wallet PnL (BEING CHECKED, deposits may be missing: value now + withdrawn - deposited) {money(wpnl)} "
                 f"({pct(wpnl / fl['in'] if fl['in'] else None)}) | Wallet value {money(value)} "
                 f"(cash {money(cash)}) | Deposited {money(fl['in'])} | Withdrawn {money(fl['out'])} | "
                 f"With 77p7 wallet: received {money(fl['other_in'])}, sent {money(fl['other_out'])} | ")

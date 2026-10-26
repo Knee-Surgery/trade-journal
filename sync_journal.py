@@ -64,15 +64,29 @@ def latest_signature():
 
 _sol_cache = {}
 def sol_usd(ts):
-    """SOL/USD close at the minute of the tx (Binance public klines)."""
+    """SOL/USD close at the minute of the tx. Binance blocks US runners (HTTP 451), so Binance.US
+    and then Kraken are tried too. None if no source answers."""
     k = ts // 60
     if k not in _sol_cache:
-        r = requests.get("https://api.binance.com/api/v3/klines",
-                         params={"symbol": "SOLUSDT", "interval": "1m",
-                                 "startTime": k * 60000, "limit": 1}, timeout=20)
-        r.raise_for_status()
-        d = r.json()
-        _sol_cache[k] = float(d[0][4]) if d else None
+        _sol_cache[k] = None
+        for host, sym in (("api.binance.com", "SOLUSDT"), ("api.binance.us", "SOLUSD")):
+            try:
+                r = requests.get(f"https://{host}/api/v3/klines", timeout=20, params={
+                    "symbol": sym, "interval": "1m", "startTime": k * 60000, "limit": 1})
+                r.raise_for_status()
+                d = r.json()
+                if d:
+                    _sol_cache[k] = float(d[0][4]); break
+            except Exception:
+                pass
+        if _sol_cache[k] is None:
+            try:
+                r = requests.get("https://api.kraken.com/0/public/OHLC", timeout=20,
+                                 params={"pair": "SOLUSD", "interval": 1, "since": k * 60 - 60})
+                rows = next(iter(r.json()["result"].values()))
+                _sol_cache[k] = float(rows[0][4]) if rows else None
+            except Exception:
+                pass
     return _sol_cache[k]
 
 
@@ -736,7 +750,10 @@ def tick(state, charts):
         print(f"{len(new)} new txs ({len(state['txs'])} total)")
         state["events"], state["closed"], state["open"] = to_trades(state["txs"])
         sync_history(state["events"], state["closed"])
-        state["flows"] = flows(state["txs"])
+        try:
+            state["flows"] = flows(state["txs"])
+        except Exception as ex:
+            print("deposit/withdrawal step skipped:", repr(ex)); state["flows"] = None
         state["sig"] = sig
     events = state["events"]
     rows, unreal, cost_priced, open_val = sync_open(state["open"])
@@ -776,7 +793,7 @@ def tick(state, charts):
            f"Unrealised PnL {money(unreal)} ({pct(unreal_pct)}) | "
            f"Total PnL {money(net + unreal)} ({pct(total_pct)}) | "
            f"Open value {money(open_val)} across {len(rows)} positions | ")
-    if cash is not None:
+    if cash is not None and fl:
         value = open_val + cash
         wpnl = value + fl["out"] - fl["in"]
         kpi += (f"Wallet PnL (value now + withdrawn - deposited) {money(wpnl)} "

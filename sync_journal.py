@@ -31,35 +31,59 @@ DUST = 1e-9
 
 
 # ---------- data fetch ----------
+def rpc(method, params):
+    r = requests.post(f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}", timeout=20,
+                      json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+    r.raise_for_status()
+    j = r.json()
+    if "error" in j:
+        raise RuntimeError(j["error"])
+    return j["result"]
+
+
+_stable_accounts = []
+def watched():
+    """The wallet plus its stablecoin token accounts. Incoming USDC only touches the token account,
+    so deposits never show up in the wallet address's own history."""
+    if not _stable_accounts:
+        for mint in STABLES:
+            res = rpc("getTokenAccountsByOwner", [WALLET, {"mint": mint}, {"encoding": "jsonParsed"}])
+            _stable_accounts.extend(a["pubkey"] for a in res["value"])
+    return [WALLET] + _stable_accounts
+
+
 def fetch_swaps(known=()):
-    """Wallet history, newest first from Helius. Stops paging at the first already-known signature."""
-    out, before = [], None
-    while True:
-        url = f"https://api.helius.xyz/v0/addresses/{WALLET}/transactions"
-        params = {"api-key": HELIUS_KEY, "limit": 100}
-        if before:
-            params["before"] = before
-        r = requests.get(url, params=params, timeout=30)
-        r.raise_for_status()
-        batch = r.json()
-        if not batch:
-            break
-        new = [t for t in batch if t["signature"] not in known]
-        out += new
-        if len(new) < len(batch):
-            break
-        before = batch[-1]["signature"]
+    """History of the wallet and its stablecoin accounts from Helius, oldest first.
+    Paging stops at the first already-known signature."""
+    out, seen = [], set(known)
+    for addr in watched():
+        before = None
+        while True:
+            params = {"api-key": HELIUS_KEY, "limit": 100}
+            if before:
+                params["before"] = before
+            r = requests.get(f"https://api.helius.xyz/v0/addresses/{addr}/transactions",
+                             params=params, timeout=30)
+            r.raise_for_status()
+            batch = r.json()
+            if not batch:
+                break
+            new = [t for t in batch if t["signature"] not in seen]
+            seen |= {t["signature"] for t in new}
+            out += new
+            if any(t["signature"] in known for t in batch):
+                break
+            before = batch[-1]["signature"]
     return sorted(out, key=lambda t: t["timestamp"])
 
 
 def latest_signature():
-    """Newest wallet signature via plain RPC: a cheap 'anything new?' check before the full fetch."""
-    r = requests.post(f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}", timeout=20, json={
-        "jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
-        "params": [WALLET, {"limit": 1}]})
-    r.raise_for_status()
-    res = r.json().get("result") or []
-    return res[0]["signature"] if res else None
+    """Newest signature of each watched address via plain RPC: a cheap 'anything new?' check."""
+    sigs = []
+    for addr in watched():
+        res = rpc("getSignaturesForAddress", [addr, {"limit": 1}])
+        sigs.append(res[0]["signature"] if res else None)
+    return tuple(sigs)
 
 
 _sol_cache = {}
@@ -444,6 +468,8 @@ def flows(txs):
             f["other_" + key] += abs(usd)
     for k, (n, real, seen) in sorted(audit.items()):
         print(f"audit {k}: {n} txs, stablecoin change real={real:+.2f} seen={seen:+.2f}")
+    print(f"audit total stablecoin change {sum(v[1] for v in audit.values()):+.2f} "
+          "(should equal the stablecoins held now)")
     return f
 
 
@@ -815,7 +841,7 @@ def tick(state, charts):
     if cash is not None and fl:
         value = open_val + cash
         wpnl = value + fl["out"] - fl["in"]
-        kpi += (f"Wallet PnL (BEING CHECKED, deposits may be missing: value now + withdrawn - deposited) {money(wpnl)} "
+        kpi += (f"Wallet PnL (value now + withdrawn - deposited) {money(wpnl)} "
                 f"({pct(wpnl / fl['in'] if fl['in'] else None)}) | Wallet value {money(value)} "
                 f"(cash {money(cash)}) | Deposited {money(fl['in'])} | Withdrawn {money(fl['out'])} | "
                 f"With 77p7 wallet: received {money(fl['other_in'])}, sent {money(fl['other_out'])} | ")
